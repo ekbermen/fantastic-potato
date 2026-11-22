@@ -1,0 +1,1100 @@
+name: Cepde3
+
+# Tek yml: projeyi uretir, logoyu cizer, APK derler, zip'ler.
+# Kullanim: bu dosyayi .github/workflows/Cepde3.yml olarak repoya koy -> Actions > Cepde3 > Run workflow
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-34 build-tools;34.0.0 ndk;26.1.10909125 cmake;3.22.1'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Proje dosyalarini uret (Gradle, Manifest, Kotlin)
+        run: |
+          set -e
+          P=Cepde3
+          M=$P/app/src/main
+          mkdir -p $M/java/com/cepde3/app $M/cpp $M/res/drawable-nodpi
+          for d in mdpi hdpi xhdpi xxhdpi xxxhdpi; do mkdir -p $M/res/mipmap-$d; done
+
+          cat > $P/settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "Cepde3"
+          include ':app'
+          EOF
+
+          cat > $P/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          EOF
+
+          cat > $P/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat > $P/app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.cepde3.app'
+              compileSdk 34
+              ndkVersion '26.1.10909125'
+              defaultConfig {
+                  applicationId 'com.cepde3.app'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '0.1-A2'
+                  ndk { abiFilters 'arm64-v8a' }
+                  externalNativeBuild { cmake { cppFlags '-std=c++17 -O2' } }
+              }
+              externalNativeBuild {
+                  cmake { path 'src/main/cpp/CMakeLists.txt'; version '3.22.1' }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          EOF
+
+          cat > $M/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="Cepde3"
+                  android:icon="@mipmap/ic_launcher"
+                  android:allowBackup="false"
+                  android:largeHeap="true"
+                  android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="sensorLandscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > $M/java/com/cepde3/app/MainActivity.kt <<'EOF'
+          package com.cepde3.app
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Bitmap
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.KeyEvent
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+
+          object Native {
+              init { System.loadLibrary("cepde3") }
+              external fun loadElf(data: ByteArray): Boolean
+              external fun loadSelfTest(): Boolean
+              external fun start()
+              external fun stop()
+              external fun isRunning(): Boolean
+              external fun pollLog(): String
+              external fun fillFramebuffer(out: IntArray)
+              external fun stats(): String
+              external fun setPad(mask: Int)
+              external fun setVideo(on: Boolean)
+              external fun describe(head: ByteArray): String
+          }
+
+          class MainActivity : Activity() {
+              private val fw = 640
+              private val fh = 360
+              private lateinit var logView: TextView
+              private lateinit var scroll: ScrollView
+              private lateinit var fbView: ImageView
+              private lateinit var statView: TextView
+              private val bmp = Bitmap.createBitmap(fw, fh, Bitmap.Config.ARGB_8888)
+              private val px = IntArray(fw * fh)
+              private val ui = Handler(Looper.getMainLooper())
+              private val sb = StringBuilder()
+              private var showFps = true
+              private var frames = 0
+              private var fps = 0
+              private var lastT = System.nanoTime()
+              private var pad = 0
+              private var video = false
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              @Suppress("DEPRECATION")
+              private fun hideBars() {
+                  window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_FULLSCREEN
+                      or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                      or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                      or View.SYSTEM_UI_FLAG_LAYOUT_STABLE)
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  hideBars()
+                  setContentView(buildUi())
+                  appendLog("Cepde3 çekirdek hazır (A1 bellek+ELF64, A2 PPU yorumlayıcı).")
+                  appendLog("'Dahili Test' ile çekirdeği dene veya bir PS3 ELF seç.")
+                  ui.post(tick)
+              }
+
+              override fun onWindowFocusChanged(hasFocus: Boolean) {
+                  super.onWindowFocusChanged(hasFocus)
+                  if (hasFocus) hideBars()
+              }
+
+              private fun btn(label: String, onClick: (Button) -> Unit): Button {
+                  val b = Button(this)
+                  b.text = label
+                  b.isAllCaps = false
+                  b.textSize = 13f
+                  b.setOnClickListener { onClick(b) }
+                  return b
+              }
+
+              private fun buildUi(): View {
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.HORIZONTAL
+                  root.setBackgroundColor(0xFF0B0E2E.toInt())
+                  root.setPadding(dp(8), dp(8), dp(8), dp(8))
+
+                  val left = LinearLayout(this)
+                  left.orientation = LinearLayout.VERTICAL
+                  left.gravity = Gravity.CENTER_HORIZONTAL
+                  val logo = ImageView(this)
+                  logo.setImageResource(R.drawable.logo)
+                  left.addView(logo, LinearLayout.LayoutParams(dp(84), dp(84)))
+                  val title = TextView(this)
+                  title.text = "Cepde3"
+                  title.textSize = 20f
+                  title.setTextColor(0xFFFFFFFF.toInt())
+                  title.setTypeface(null, Typeface.BOLD)
+                  title.gravity = Gravity.CENTER
+                  left.addView(title)
+                  left.addView(btn("Oyun/ELF Seç") {
+                      val it = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                      it.addCategory(Intent.CATEGORY_OPENABLE)
+                      it.type = "*/*"
+                      @Suppress("DEPRECATION")
+                      startActivityForResult(it, 1)
+                  })
+                  left.addView(btn("Dahili Test") {
+                      Thread {
+                          Native.stop()
+                          if (Native.loadSelfTest()) Native.start()
+                      }.start()
+                  })
+                  left.addView(btn("Durdur") { Native.stop() })
+                  left.addView(btn("Ekran: Harita") { b ->
+                      video = !video
+                      Native.setVideo(video)
+                      b.text = if (video) "Ekran: Video" else "Ekran: Harita"
+                  })
+                  left.addView(btn("FPS: Açık") { b ->
+                      showFps = !showFps
+                      b.text = if (showFps) "FPS: Açık" else "FPS: Kapalı"
+                  })
+                  val leftScroll = ScrollView(this)
+                  leftScroll.addView(left)
+                  root.addView(leftScroll, LinearLayout.LayoutParams(dp(170), LinearLayout.LayoutParams.MATCH_PARENT))
+
+                  val right = LinearLayout(this)
+                  right.orientation = LinearLayout.VERTICAL
+                  statView = TextView(this)
+                  statView.setTextColor(0xFF7FD6FF.toInt())
+                  statView.typeface = Typeface.MONOSPACE
+                  statView.textSize = 11f
+                  right.addView(statView)
+                  fbView = ImageView(this)
+                  fbView.scaleType = ImageView.ScaleType.FIT_CENTER
+                  fbView.setImageBitmap(bmp)
+                  right.addView(fbView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.4f))
+                  scroll = ScrollView(this)
+                  logView = TextView(this)
+                  logView.setTextColor(0xFFCFE8FF.toInt())
+                  logView.typeface = Typeface.MONOSPACE
+                  logView.textSize = 11f
+                  scroll.addView(logView)
+                  right.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+                  right.addView(padRow(), LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+                  val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
+                  lp.leftMargin = dp(8)
+                  root.addView(right, lp)
+                  return root
+              }
+
+              private fun padRow(): LinearLayout {
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  val defs = listOf("◀" to 4, "▲" to 1, "▼" to 2, "▶" to 8, "✕" to 16, "○" to 32, "□" to 64, "△" to 128, "START" to 1024)
+                  for ((t, m) in defs) {
+                      val b = Button(this)
+                      b.text = t
+                      b.textSize = 12f
+                      b.minWidth = 0
+                      b.minimumWidth = 0
+                      b.setPadding(dp(2), 0, dp(2), 0)
+                      b.setOnTouchListener { _, e ->
+                          when (e.actionMasked) {
+                              MotionEvent.ACTION_DOWN -> { pad = pad or m; Native.setPad(pad) }
+                              MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { pad = pad and m.inv(); Native.setPad(pad) }
+                          }
+                          false
+                      }
+                      row.addView(b, LinearLayout.LayoutParams(0, dp(40), 1f))
+                  }
+                  return row
+              }
+
+              private fun appendLog(s: String) {
+                  sb.append(s).append('\n')
+                  if (sb.length > 12000) sb.delete(0, sb.length - 8000)
+                  logView.text = sb
+                  scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+              }
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      val s = Native.pollLog()
+                      if (s.isNotEmpty()) appendLog(s.trimEnd())
+                      Native.fillFramebuffer(px)
+                      bmp.setPixels(px, 0, fw, 0, 0, fw, fh)
+                      fbView.invalidate()
+                      frames++
+                      val now = System.nanoTime()
+                      if (now - lastT >= 1_000_000_000L) { fps = frames; frames = 0; lastT = now }
+                      statView.text = (if (showFps) "FPS:" + fps + "  " else "") + Native.stats()
+                      ui.postDelayed(this, 66)
+                  }
+              }
+
+              @Suppress("DEPRECATION")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  val uri = data?.data ?: return
+                  if (requestCode != 1 || resultCode != RESULT_OK) return
+                  appendLog("Dosya okunuyor...")
+                  Thread {
+                      try {
+                          Native.stop()
+                          val head = ByteArray(0x9000)
+                          var n = 0
+                          contentResolver.openInputStream(uri)?.use { ins ->
+                              while (n < head.size) { val r = ins.read(head, n, head.size - n); if (r <= 0) break; n += r }
+                          }
+                          if (n == 0) {
+                              runOnUiThread { appendLog("Dosya açılamadı.") }
+                          } else if (n >= 4 && head[0] == 0x7f.toByte() && head[1] == 'E'.code.toByte() && head[2] == 'L'.code.toByte() && head[3] == 'F'.code.toByte()) {
+                              val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                              if (bytes != null && Native.loadElf(bytes)) Native.start()
+                          } else {
+                              val d = Native.describe(head.copyOf(n))
+                              runOnUiThread { appendLog("[Dosya] " + d) }
+                          }
+                      } catch (e: Exception) {
+                          runOnUiThread { appendLog("Hata: " + e.message) }
+                      }
+                  }.start()
+              }
+
+              private fun padBit(k: Int): Int = when (k) {
+                  KeyEvent.KEYCODE_DPAD_UP -> 1
+                  KeyEvent.KEYCODE_DPAD_DOWN -> 2
+                  KeyEvent.KEYCODE_DPAD_LEFT -> 4
+                  KeyEvent.KEYCODE_DPAD_RIGHT -> 8
+                  KeyEvent.KEYCODE_BUTTON_A -> 16
+                  KeyEvent.KEYCODE_BUTTON_B -> 32
+                  KeyEvent.KEYCODE_BUTTON_X -> 64
+                  KeyEvent.KEYCODE_BUTTON_Y -> 128
+                  KeyEvent.KEYCODE_BUTTON_L1 -> 256
+                  KeyEvent.KEYCODE_BUTTON_R1 -> 512
+                  KeyEvent.KEYCODE_BUTTON_START -> 1024
+                  KeyEvent.KEYCODE_BUTTON_SELECT -> 2048
+                  else -> 0
+              }
+
+              override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+                  val m = padBit(keyCode)
+                  if (m != 0) { pad = pad or m; Native.setPad(pad); return true }
+                  return super.onKeyDown(keyCode, event)
+              }
+
+              override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
+                  val m = padBit(keyCode)
+                  if (m != 0) { pad = pad and m.inv(); Native.setPad(pad); return true }
+                  return super.onKeyUp(keyCode, event)
+              }
+
+              override fun onDestroy() {
+                  ui.removeCallbacks(tick)
+                  Native.stop()
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+      - name: Cekirdegi uret (C++ - A1 bellek/ELF64, A2 PPU yorumlayici)
+        run: |
+          set -e
+          M=Cepde3/app/src/main
+
+          cat > $M/cpp/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.22.1)
+          project(cepde3)
+          set(CMAKE_CXX_STANDARD 17)
+          add_library(cepde3 SHARED cepde3.cpp)
+          target_link_libraries(cepde3 log)
+          target_link_options(cepde3 PRIVATE -Wl,-z,max-page-size=16384)
+          EOF
+
+          cat > $M/cpp/cepde3.cpp <<'EOF'
+          // Cepde3 cekirdek v0.1
+          // A1: big-endian bellek (4 GB sanal alan) + ELF64 yukleyici
+          // A2: PPU (PowerPC 64) yorumlayici - temel tamsayi komut seti
+          // A3 (kismi): LV2 syscall HLE (tty_write, process_exit, time, usleep)
+          #include <jni.h>
+          #include <android/log.h>
+          #include <sys/mman.h>
+          #include <atomic>
+          #include <thread>
+          #include <mutex>
+          #include <string>
+          #include <vector>
+          #include <chrono>
+          #include <cmath>
+          #include <cstdint>
+          #include <cstdarg>
+          #include <cstdio>
+          #include <cstring>
+
+          typedef uint8_t u8;   typedef uint16_t u16;  typedef uint32_t u32;  typedef uint64_t u64;
+          typedef int8_t s8;    typedef int16_t s16;   typedef int32_t s32;   typedef int64_t s64;
+          typedef unsigned long long ull;
+
+          // ---------------- Log ----------------
+          static std::mutex g_logMx;
+          static std::string g_log;
+          static void cplog(const char* fmt, ...) {
+              char b[600];
+              va_list a; va_start(a, fmt); vsnprintf(b, sizeof b, fmt, a); va_end(a);
+              std::lock_guard<std::mutex> l(g_logMx);
+              g_log += b; g_log += '\n';
+              __android_log_print(ANDROID_LOG_INFO, "Cepde3", "%s", b);
+          }
+
+          // ---------------- A1: Bellek ----------------
+          struct Mem {
+              u8* base = nullptr; u64 size = 0; bool fault = false; u64 faultAddr = 0;
+              bool init() {
+                  if (base) return true;
+                  const u64 tries[] = {0x100000000ULL, 0x40000000ULL, 0x10000000ULL};
+                  for (u64 s : tries) {
+                      void* p = mmap(nullptr, s, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+                      if (p != MAP_FAILED) { base = (u8*)p; size = s; fault = false; return true; }
+                  }
+                  return false;
+              }
+              void release() { if (base) { munmap(base, size); base = nullptr; size = 0; } }
+              bool chk(u64 a, u64 n) {
+                  if (a > size || n > size - a) { fault = true; faultAddr = a; return false; }
+                  return true;
+              }
+              u8  r8(u64 a)  { return chk(a, 1) ? base[a] : 0; }
+              u16 r16(u64 a) { if (!chk(a, 2)) return 0; u16 v; memcpy(&v, base + a, 2); return __builtin_bswap16(v); }
+              u32 r32(u64 a) { if (!chk(a, 4)) return 0; u32 v; memcpy(&v, base + a, 4); return __builtin_bswap32(v); }
+              u64 r64(u64 a) { if (!chk(a, 8)) return 0; u64 v; memcpy(&v, base + a, 8); return __builtin_bswap64(v); }
+              void w8(u64 a, u8 v)   { if (chk(a, 1)) base[a] = v; }
+              void w16(u64 a, u16 v) { if (chk(a, 2)) { v = __builtin_bswap16(v); memcpy(base + a, &v, 2); } }
+              void w32(u64 a, u32 v) { if (chk(a, 4)) { v = __builtin_bswap32(v); memcpy(base + a, &v, 4); } }
+              void w64(u64 a, u64 v) { if (chk(a, 8)) { v = __builtin_bswap64(v); memcpy(base + a, &v, 8); } }
+          };
+
+          struct PPU {
+              u64 gpr[32] = {};
+              u64 pc = 0, lr = 0, ctr = 0, xer = 0, insts = 0;
+                  double f[32] = {};
+                  u32 ca = 0;
+                  u32 cr = 0;
+              bool halted = true;
+              int exitCode = 0;
+          };
+
+          static Mem g_mem;
+          static PPU g_cpu;
+          static std::mutex g_mx;
+          static std::thread g_th;
+          static std::atomic<bool> g_run{false};
+          static bool g_loaded = false;
+          static u64 g_viewBase = 0x10000;
+          static std::atomic<u32> g_pad{0};
+          static std::atomic<bool> g_video{false};
+          static u64 g_heap = 0x30000000ULL;
+          static double g_mipsLast = 0;
+          static std::chrono::steady_clock::time_point g_t0 = std::chrono::steady_clock::now();
+
+          // ---------------- A3: LV2 syscall HLE ----------------
+          static void lv2(PPU& c, Mem& m) {
+              u64 n = c.gpr[11];
+              switch (n) {
+                  case 22:   // sys_process_exit
+                  case 41:   // sys_ppu_thread_exit
+                      c.halted = true; c.exitCode = (int)c.gpr[3];
+                      cplog("[LV2] exit(%d)", c.exitCode);
+                      break;
+                  case 403: { // sys_tty_write(ch, buf, len, *written)
+                      u64 buf = c.gpr[4]; u32 len = (u32)c.gpr[5];
+                      if (len > 2048) len = 2048;
+                      std::string s;
+                      for (u32 k = 0; k < len; k++) {
+                          u8 ch = m.r8(buf + k);
+                          if (ch >= 0x20 && ch < 0x7F) s += (char)ch; else if (ch == '\n' || ch == '\t') s += ' ';
+                      }
+                      cplog("[TTY] %s", s.c_str());
+                      if (c.gpr[6]) m.w32(c.gpr[6], len);
+                      c.gpr[3] = 0;
+                      break;
+                  }
+                  case 145: { // sys_time_get_system_time (us)
+                      auto d = std::chrono::steady_clock::now().time_since_epoch();
+                      c.gpr[3] = (u64)std::chrono::duration_cast<std::chrono::microseconds>(d).count();
+                      break;
+                  }
+                  case 141: { // sys_timer_usleep
+                      u64 us = c.gpr[3]; if (us > 1000000) us = 1000000;
+                      std::this_thread::sleep_for(std::chrono::microseconds(us));
+                      c.gpr[3] = 0;
+                      break;
+                  }
+                  case 348: { // sys_memory_allocate(size, flags, *addr)
+                      u64 sz = (c.gpr[3] + 0xFFFFF) & ~0xFFFFFULL;
+                      if (g_heap + sz > m.size) { c.gpr[3] = 0x80010004; break; }
+                      m.w32(c.gpr[5], (u32)g_heap); g_heap += sz; c.gpr[3] = 0;
+                      break; }
+                  case 349: c.gpr[3] = 0; break;  // sys_memory_free
+                  case 48:  m.w64(c.gpr[3], 1); c.gpr[3] = 0; break; // sys_ppu_thread_get_id
+                  case 43: case 142:  c.gpr[3] = 0; break; // yield / timer_sleep
+                  case 95: case 96: case 97: case 98: case 99:        // lwmutex (tek is parcacigi)
+                  case 100: case 101: case 102: case 103: case 104:   // mutex
+                      c.gpr[3] = 0; break;
+                  default:
+                      cplog("[LV2] HLE yok: syscall %llu -> 0 donuyor", (ull)n);
+                      c.gpr[3] = 0;
+                      break;
+              }
+          }
+
+          // ---------------- A2: PPU yorumlayici ----------------
+          static inline u64 rotl64(u64 v, int n) { n &= 63; return n ? (v << n) | (v >> (64 - n)) : v; }
+          static inline u32 rotl32(u32 v, int n) { n &= 31; return n ? (v << n) | (v >> (32 - n)) : v; }
+          static u64 mask64(int mb, int me) {
+              u64 a = ~0ULL >> mb, b = ~0ULL << (63 - me);
+              return mb <= me ? (a & b) : (a | b);
+          }
+
+          static void step(PPU& c, Mem& m) {
+              const u64 pc = c.pc;
+              const u32 i = m.r32(pc);
+              if (m.fault) { c.halted = true; return; }
+              u64 npc = pc + 4;
+              c.insts++;
+              const u32 op = i >> 26;
+              const int rt = (i >> 21) & 31, ra = (i >> 16) & 31, rb = (i >> 11) & 31;
+              const s64 simm = (s16)(i & 0xFFFF);
+              const u64 uimm = i & 0xFFFF;
+              u64* R = c.gpr;
+              bool bad = false;
+
+              auto ra0 = [&]() -> u64 { return ra ? R[ra] : 0; };
+              auto crf = [&](int f, bool lt, bool gt) {
+                  u32 nib = (lt ? 8 : gt ? 4 : 2) | (u32)((c.xer >> 31) & 1);
+                  int sh = (7 - f) * 4;
+                  c.cr = (c.cr & ~(0xFu << sh)) | (nib << sh);
+              };
+              auto rc = [&](u64 v) { if (i & 1) { s64 s = (s64)v; crf(0, s < 0, s > 0); } };
+              auto cmps = [&](int f, s64 a, s64 b) { crf(f, a < b, a > b); };
+              auto cmpu = [&](int f, u64 a, u64 b) { crf(f, a < b, a > b); };
+              auto condOk = [&](int bo, int bi) -> bool {
+                  bool ctrOk = true;
+                  if (!(bo & 4)) { c.ctr--; ctrOk = ((c.ctr != 0) != (bool)((bo >> 1) & 1)); }
+                  bool cOk = (bo & 16) || (((c.cr >> (31 - bi)) & 1) == (u32)((bo >> 3) & 1));
+                  return ctrOk && cOk;
+              };
+
+              double* F = c.f;
+              auto bits2d = [](u64 b) { double d; memcpy(&d, &b, 8); return d; };
+              auto d2bits = [](double d) { u64 b; memcpy(&b, &d, 8); return b; };
+              auto s2d = [](u32 b) { float f; memcpy(&f, &b, 4); return (double)f; };
+              auto d2s = [](double d) { float f = (float)d; u32 b; memcpy(&b, &f, 4); return b; };
+              auto f2i32 = [](double v) -> s32 { if (std::isnan(v)) return INT32_MIN; if (v >= 2147483647.0) return INT32_MAX; if (v <= -2147483648.0) return INT32_MIN; return (s32)v; };
+              auto f2i64 = [](double v) -> s64 { if (std::isnan(v)) return INT64_MIN; if (v >= 9223372036854775807.0) return INT64_MAX; if (v <= -9223372036854775808.0) return INT64_MIN; return (s64)v; };
+
+              switch (op) {
+                  case 7:  R[rt] = (u64)((s64)R[ra] * simm); break;               // mulli
+                  case 8:  c.ca = ((u64)simm >= R[ra]); R[rt] = (u64)(simm - (s64)R[ra]); break;  // subfic
+                  case 10: { int bf = (i >> 23) & 7; bool L = (i >> 21) & 1;      // cmpli
+                      cmpu(bf, L ? R[ra] : (u64)(u32)R[ra], uimm); break; }
+                  case 11: { int bf = (i >> 23) & 7; bool L = (i >> 21) & 1;      // cmpi
+                      cmps(bf, L ? (s64)R[ra] : (s64)(s32)R[ra], simm); break; }
+                  case 12: R[rt] = R[ra] + (u64)simm; c.ca = R[rt] < R[ra]; break;  // addic
+                  case 13: R[rt] = R[ra] + (u64)simm; c.ca = R[rt] < R[ra]; { s64 s = (s64)R[rt]; crf(0, s < 0, s > 0); } break; // addic.
+                  case 14: R[rt] = ra0() + (u64)simm; break;                      // addi / li
+                  case 15: R[rt] = ra0() + (u64)(simm * 65536); break;            // addis / lis
+                  case 16: { // bc
+                      bool take = condOk(rt, ra);
+                      s64 bd = (s16)(i & 0xFFFC);
+                      if (i & 1) c.lr = pc + 4;
+                      if (take) npc = (i & 2) ? (u64)bd : pc + (u64)bd;
+                      break; }
+                  case 17: lv2(c, m); break; // sc
+                  case 18: { // b
+                      s64 li = (s64)((s32)(i & 0x03FFFFFC) << 6 >> 6);
+                      if (i & 1) c.lr = pc + 4;
+                      npc = (i & 2) ? (u64)li : pc + (u64)li;
+                      break; }
+                  case 19: {
+                      u32 xo = (i >> 1) & 0x3FF;
+                      if (xo == 16 || xo == 528) { // bclr / bcctr
+                          u64 t = (xo == 16 ? c.lr : c.ctr) & ~3ULL;
+                          bool take = condOk(rt, ra);
+                          if (i & 1) c.lr = pc + 4;
+                          if (take) npc = t;
+                      } else if (xo == 150) { /* isync */ }
+                      else bad = true;
+                      break; }
+                  case 20: { u64 lo = (u32)R[rt]; u64 v = rotl64((lo << 32) | lo, rb);          // rlwimi
+                      u64 mk = mask64(((i >> 6) & 31) + 32, ((i >> 1) & 31) + 32);
+                      R[ra] = (v & mk) | (R[ra] & ~mk); rc(R[ra]); break; }
+                  case 21: { u64 lo = (u32)R[rt]; u64 v = rotl64((lo << 32) | lo, rb);          // rlwinm
+                      R[ra] = v & mask64(((i >> 6) & 31) + 32, ((i >> 1) & 31) + 32); rc(R[ra]); break; }
+                  case 23: { u64 lo = (u32)R[rt]; u64 v = rotl64((lo << 32) | lo, (int)(R[rb] & 31)); // rlwnm
+                      R[ra] = v & mask64(((i >> 6) & 31) + 32, ((i >> 1) & 31) + 32); rc(R[ra]); break; }
+                  case 24: R[ra] = R[rt] | uimm; break;                           // ori
+                  case 25: R[ra] = R[rt] | (uimm << 16); break;                   // oris
+                  case 26: R[ra] = R[rt] ^ uimm; break;                           // xori
+                  case 27: R[ra] = R[rt] ^ (uimm << 16); break;                   // xoris
+                  case 28: R[ra] = R[rt] & uimm; { s64 s = (s64)R[ra]; crf(0, s < 0, s > 0); } break;         // andi.
+                  case 29: R[ra] = R[rt] & (uimm << 16); { s64 s = (s64)R[ra]; crf(0, s < 0, s > 0); } break; // andis.
+                  case 30: { // rld*
+                      u64 rs = R[rt];
+                      int sh = (int)(((i >> 11) & 31) | ((i & 2) << 4));
+                      int mbe = (int)(((i >> 6) & 31) | (i & 0x20));
+                      switch ((i >> 2) & 7) {
+                          case 0: R[ra] = rotl64(rs, sh) & mask64(mbe, 63); break;           // rldicl
+                          case 1: R[ra] = rotl64(rs, sh) & mask64(0, mbe); break;            // rldicr
+                          case 2: R[ra] = rotl64(rs, sh) & mask64(mbe, 63 - sh); break;      // rldic
+                          case 3: { u64 mk = mask64(mbe, 63 - sh);                           // rldimi
+                              R[ra] = (rotl64(rs, sh) & mk) | (R[ra] & ~mk); break; }
+                          default: bad = true; break;
+                      }
+                      if (!bad) rc(R[ra]);
+                      break; }
+                  case 31: {
+                      u32 xo = (i >> 1) & 0x3FF;
+                      switch (xo) {
+                          case 0:  { int bf = (i >> 23) & 7; if ((i >> 21) & 1) cmps(bf, (s64)R[ra], (s64)R[rb]); else cmps(bf, (s32)R[ra], (s32)R[rb]); break; }
+                          case 32: { int bf = (i >> 23) & 7; if ((i >> 21) & 1) cmpu(bf, R[ra], R[rb]); else cmpu(bf, (u32)R[ra], (u32)R[rb]); break; }
+                          case 266: case 778: R[rt] = R[ra] + R[rb]; rc(R[rt]); break;           // add
+                          case 40:  case 552: R[rt] = R[rb] - R[ra]; rc(R[rt]); break;           // subf
+                          case 104: case 616: R[rt] = (u64)(-(s64)R[ra]); rc(R[rt]); break;      // neg
+                          case 235: case 747: R[rt] = (u64)((s64)(s32)R[ra] * (s64)(s32)R[rb]); rc(R[rt]); break; // mullw
+                          case 491: case 1003: { s32 a = (s32)R[ra], b = (s32)R[rb];             // divw
+                              R[rt] = (b == 0 || (a == INT32_MIN && b == -1)) ? 0 : (u64)(u32)(a / b); rc(R[rt]); break; }
+                          case 459: case 971: { u32 a = (u32)R[ra], b = (u32)R[rb];              // divwu
+                              R[rt] = b ? (u64)(a / b) : 0; rc(R[rt]); break; }
+                          case 28:  R[ra] = R[rt] & R[rb]; rc(R[ra]); break;
+                          case 60:  R[ra] = R[rt] & ~R[rb]; rc(R[ra]); break;
+                          case 444: R[ra] = R[rt] | R[rb]; rc(R[ra]); break;
+                          case 316: R[ra] = R[rt] ^ R[rb]; rc(R[ra]); break;
+                          case 124: R[ra] = ~(R[rt] | R[rb]); rc(R[ra]); break;
+                          case 476: R[ra] = ~(R[rt] & R[rb]); rc(R[ra]); break;
+                          case 284: R[ra] = ~(R[rt] ^ R[rb]); rc(R[ra]); break;
+                          case 412: R[ra] = R[rt] | ~R[rb]; rc(R[ra]); break;
+                          case 24:  { u32 n = R[rb] & 0x3F; R[ra] = n < 32 ? (u64)(u32)((u32)R[rt] << n) : 0; rc(R[ra]); break; }   // slw
+                          case 536: { u32 n = R[rb] & 0x3F; R[ra] = n < 32 ? (u64)((u32)R[rt] >> n) : 0; rc(R[ra]); break; }          // srw
+                          case 792: { s32 v = (s32)R[rt]; u32 n = R[rb] & 0x3F; R[ra] = (u64)(s64)(n < 32 ? (v >> n) : (v < 0 ? -1 : 0)); c.ca = v < 0 && ((n >= 32) ? 1 : (n && ((u32)v & ((1u << n) - 1)))); rc(R[ra]); break; } // sraw
+                          case 824: { s32 v = (s32)R[rt]; R[ra] = (u64)(s64)(v >> rb); c.ca = v < 0 && rb && ((u32)v & ((1u << rb) - 1)); rc(R[ra]); break; } // srawi
+                          case 26:  { u32 v = (u32)R[rt]; R[ra] = v ? (u64)__builtin_clz(v) : 32; rc(R[ra]); break; }                 // cntlzw
+                          case 954: R[ra] = (u64)(s64)(s8)R[rt]; rc(R[ra]); break;
+                          case 922: R[ra] = (u64)(s64)(s16)R[rt]; rc(R[ra]); break;
+                          case 986: R[ra] = (u64)(s64)(s32)R[rt]; rc(R[ra]); break;
+                          case 23:  case 20:  R[rt] = m.r32(ra0() + R[rb]); break;                // lwzx / lwarx
+                          case 55:  { u64 ea = R[ra] + R[rb]; R[rt] = m.r32(ea); R[ra] = ea; break; }
+                          case 87:  R[rt] = m.r8(ra0() + R[rb]); break;
+                          case 279: R[rt] = m.r16(ra0() + R[rb]); break;
+                          case 343: R[rt] = (u64)(s64)(s16)m.r16(ra0() + R[rb]); break;
+                          case 21:  R[rt] = m.r64(ra0() + R[rb]); break;
+                          case 151: m.w32(ra0() + R[rb], (u32)R[rt]); break;
+                          case 150: m.w32(ra0() + R[rb], (u32)R[rt]); crf(0, false, false); break; // stwcx.
+                          case 183: { u64 ea = R[ra] + R[rb]; m.w32(ea, (u32)R[rt]); R[ra] = ea; break; }
+                          case 215: m.w8(ra0() + R[rb], (u8)R[rt]); break;
+                          case 407: m.w16(ra0() + R[rb], (u16)R[rt]); break;
+                          case 149: m.w64(ra0() + R[rb], R[rt]); break;
+                          case 339: { u32 spr = ((i >> 16) & 31) | (((i >> 11) & 31) << 5);          // mfspr
+                              R[rt] = spr == 8 ? c.lr : spr == 9 ? c.ctr : spr == 1 ? ((c.xer & ~(1ULL << 29)) | ((u64)c.ca << 29)) : (spr == 268 || spr == 269) ? c.insts : 0; break; }
+                          case 467: { u32 spr = ((i >> 16) & 31) | (((i >> 11) & 31) << 5);          // mtspr
+                              if (spr == 8) c.lr = R[rt]; else if (spr == 9) c.ctr = R[rt]; else if (spr == 1) { c.xer = R[rt]; c.ca = (R[rt] >> 29) & 1; } break; }
+                          case 371: R[rt] = c.insts; break;                                           // mftb
+                          case 19:  R[rt] = c.cr; break;                                              // mfcr
+                          case 144: { u32 fxm = (i >> 12) & 0xFF;                                     // mtcrf
+                              for (int k = 0; k < 8; k++) if (fxm & (0x80 >> k)) {
+                                  int sh = (7 - k) * 4;
+                                  c.cr = (c.cr & ~(0xFu << sh)) | (((u32)(R[rt] >> sh)) & 0xF) << sh;
+                              } break; }
+                          case 10: case 522: { u64 a = R[ra], b = R[rb]; R[rt] = a + b; c.ca = R[rt] < a; rc(R[rt]); break; }           // addc
+                          case 138: case 650: { u64 a = R[ra], b = R[rb]; u64 sm = a + b; u32 c1 = sm < a; u64 s2 = sm + c.ca; u32 c2 = s2 < sm; R[rt] = s2; c.ca = c1 | c2; rc(s2); break; } // adde
+                          case 202: case 714: { u64 a = R[ra]; u64 sm = a + c.ca; c.ca = sm < a; R[rt] = sm; rc(sm); break; }            // addze
+                          case 8: case 520: { u64 a = R[ra], b = R[rb]; R[rt] = b - a; c.ca = b >= a; rc(R[rt]); break; }                // subfc
+                          case 136: case 648: { u64 a = ~R[ra], b = R[rb]; u64 sm = a + b; u32 c1 = sm < a; u64 s2 = sm + c.ca; u32 c2 = s2 < sm; R[rt] = s2; c.ca = c1 | c2; rc(s2); break; } // subfe
+                          case 200: case 712: { u64 a = ~R[ra]; u64 sm = a + c.ca; c.ca = sm < a; R[rt] = sm; rc(sm); break; }           // subfze
+                          case 233: case 745: R[rt] = R[ra] * R[rb]; rc(R[rt]); break;                                                    // mulld
+                          case 75:  R[rt] = (u64)(s64)(((s64)(s32)R[ra] * (s64)(s32)R[rb]) >> 32); break;                                // mulhw
+                          case 11:  R[rt] = (u64)(((u64)(u32)R[ra] * (u64)(u32)R[rb]) >> 32); break;                                     // mulhwu
+                          case 73:  R[rt] = (u64)(((__int128)(s64)R[ra] * (s64)R[rb]) >> 64); break;                                     // mulhd
+                          case 9:   R[rt] = (u64)(((unsigned __int128)R[ra] * R[rb]) >> 64); break;                                      // mulhdu
+                          case 489: case 1001: { s64 a = (s64)R[ra], b = (s64)R[rb]; R[rt] = (b == 0 || (a == INT64_MIN && b == -1)) ? 0 : (u64)(a / b); rc(R[rt]); break; } // divd
+                          case 457: case 969: R[rt] = R[rb] ? R[ra] / R[rb] : 0; rc(R[rt]); break;                                       // divdu
+                          case 27:  { u32 n = R[rb] & 0x7F; R[ra] = n < 64 ? R[rt] << n : 0; rc(R[ra]); break; }                         // sld
+                          case 539: { u32 n = R[rb] & 0x7F; R[ra] = n < 64 ? R[rt] >> n : 0; rc(R[ra]); break; }                         // srd
+                          case 58:  R[ra] = R[rt] ? (u64)__builtin_clzll(R[rt]) : 64; rc(R[ra]); break;                                  // cntlzd
+                          case 794: { s64 v = (s64)R[rt]; u32 n = R[rb] & 0x7F;                                                           // srad
+                              if (n < 64) { R[ra] = (u64)(v >> n); c.ca = v < 0 && n && (((u64)v) & ((1ULL << n) - 1)); }
+                              else { R[ra] = v < 0 ? ~0ULL : 0; c.ca = v < 0; }
+                              rc(R[ra]); break; }
+                          case 826: case 827: { int sh = rb | ((i & 2) << 4); s64 v = (s64)R[rt];                                        // sradi
+                              R[ra] = (u64)(v >> sh); c.ca = v < 0 && sh && (((u64)v) & ((1ULL << sh) - 1)); rc(R[ra]); break; }
+                          case 534: R[rt] = __builtin_bswap32(m.r32(ra0() + R[rb])); break;                                               // lwbrx
+                          case 662: m.w32(ra0() + R[rb], __builtin_bswap32((u32)R[rt])); break;                                          // stwbrx
+                          case 790: R[rt] = __builtin_bswap16(m.r16(ra0() + R[rb])); break;                                              // lhbrx
+                          case 918: m.w16(ra0() + R[rb], __builtin_bswap16((u16)R[rt])); break;                                          // sthbrx
+                          case 119: { u64 ea = R[ra] + R[rb]; R[rt] = m.r8(ea); R[ra] = ea; break; }                                     // lbzux
+                          case 311: { u64 ea = R[ra] + R[rb]; R[rt] = m.r16(ea); R[ra] = ea; break; }                                    // lhzux
+                          case 247: { u64 ea = R[ra] + R[rb]; m.w8(ea, (u8)R[rt]); R[ra] = ea; break; }                                  // stbux
+                          case 53:  { u64 ea = R[ra] + R[rb]; R[rt] = m.r64(ea); R[ra] = ea; break; }                                    // ldux
+                          case 181: { u64 ea = R[ra] + R[rb]; m.w64(ea, R[rt]); R[ra] = ea; break; }                                     // stdux
+                          case 341: R[rt] = (u64)(s64)(s32)m.r32(ra0() + R[rb]); break;                                                  // lwax
+                          case 84:  R[rt] = m.r64(ra0() + R[rb]); break;                                                                  // ldarx
+                          case 214: m.w64(ra0() + R[rb], R[rt]); crf(0, false, false); break;                                             // stdcx.
+                          case 535: F[rt] = s2d(m.r32(ra0() + R[rb])); break;                                                             // lfsx
+                          case 599: F[rt] = bits2d(m.r64(ra0() + R[rb])); break;                                                          // lfdx
+                          case 663: m.w32(ra0() + R[rb], d2s(F[rt])); break;                                                              // stfsx
+                          case 727: m.w64(ra0() + R[rb], d2bits(F[rt])); break;                                                           // stfdx
+                          case 983: m.w32(ra0() + R[rb], (u32)d2bits(F[rt])); break;                                                      // stfiwx
+                          case 1014: { u64 ea = (ra0() + R[rb]) & ~127ULL; for (int k = 0; k < 16; k++) m.w64(ea + k * 8, 0); break; } // dcbz
+                          case 598: case 854: case 86: case 54: case 278: case 246: break;           // sync eieio dcbf dcbst dcbt dcbtst
+                          default: bad = true; break;
+                      }
+                      break; }
+                  case 46: { u64 ea = ra0() + (u64)simm; for (int r = rt; r < 32; r++) { R[r] = m.r32(ea); ea += 4; } break; }   // lmw
+                  case 47: { u64 ea = ra0() + (u64)simm; for (int r = rt; r < 32; r++) { m.w32(ea, (u32)R[r]); ea += 4; } break; } // stmw
+                  case 48: case 49: { u64 ea = (op == 49 ? R[ra] : ra0()) + (u64)simm; F[rt] = s2d(m.r32(ea)); if (op == 49) R[ra] = ea; break; }          // lfs lfsu
+                  case 50: case 51: { u64 ea = (op == 51 ? R[ra] : ra0()) + (u64)simm; F[rt] = bits2d(m.r64(ea)); if (op == 51) R[ra] = ea; break; }     // lfd lfdu
+                  case 52: case 53: { u64 ea = (op == 53 ? R[ra] : ra0()) + (u64)simm; m.w32(ea, d2s(F[rt])); if (op == 53) R[ra] = ea; break; }         // stfs stfsu
+                  case 54: case 55: { u64 ea = (op == 55 ? R[ra] : ra0()) + (u64)simm; m.w64(ea, d2bits(F[rt])); if (op == 55) R[ra] = ea; break; }     // stfd stfdu
+                  case 59: { double a = F[ra], b = F[rb], cc = F[(i >> 6) & 31], r = 0; bool ok = true;                                                   // tek hassasiyet
+                      switch ((i >> 1) & 0x1F) {
+                          case 18: r = a / b; break;            case 20: r = a - b; break;          case 21: r = a + b; break;
+                          case 22: r = std::sqrt(b); break;     case 24: r = 1.0 / b; break;        case 25: r = a * cc; break;
+                          case 26: r = 1.0 / std::sqrt(b); break;
+                          case 28: r = std::fma(a, cc, -b); break;   case 29: r = std::fma(a, cc, b); break;
+                          case 30: r = -std::fma(a, cc, -b); break;  case 31: r = -std::fma(a, cc, b); break;
+                          default: ok = false; break;
+                      }
+                      if (ok) F[rt] = (double)(float)r; else bad = true;
+                      break; }
+                  case 63: { double a = F[ra], b = F[rb], cc = F[(i >> 6) & 31];                                                                         // cift hassasiyet
+                      switch ((i >> 1) & 0x1F) {
+                          case 18: F[rt] = a / b; break;            case 20: F[rt] = a - b; break;          case 21: F[rt] = a + b; break;
+                          case 22: F[rt] = std::sqrt(b); break;     case 23: F[rt] = a >= 0.0 ? cc : b; break;  case 25: F[rt] = a * cc; break;
+                          case 26: F[rt] = 1.0 / std::sqrt(b); break;
+                          case 28: F[rt] = std::fma(a, cc, -b); break;   case 29: F[rt] = std::fma(a, cc, b); break;
+                          case 30: F[rt] = -std::fma(a, cc, -b); break;  case 31: F[rt] = -std::fma(a, cc, b); break;
+                          default:
+                              switch ((i >> 1) & 0x3FF) {
+                                  case 0: case 32: { int bf = (i >> 23) & 7; u32 nib = (std::isnan(a) || std::isnan(b)) ? 1 : a < b ? 8 : a > b ? 4 : 2;
+                                      int sh = (7 - bf) * 4; c.cr = (c.cr & ~(0xFu << sh)) | (nib << sh); break; }
+                                  case 12: F[rt] = (double)(float)b; break;                                         // frsp
+                                  case 14: F[rt] = bits2d((u64)(u32)f2i32(std::nearbyint(b))); break;               // fctiw
+                                  case 15: F[rt] = bits2d((u64)(u32)f2i32(std::trunc(b))); break;                   // fctiwz
+                                  case 72: F[rt] = b; break;                                                        // fmr
+                                  case 40: F[rt] = -b; break;                                                       // fneg
+                                  case 264: F[rt] = std::fabs(b); break;                                            // fabs
+                                  case 136: F[rt] = -std::fabs(b); break;                                           // fnabs
+                                  case 814: F[rt] = bits2d((u64)f2i64(std::nearbyint(b))); break;                   // fctid
+                                  case 815: F[rt] = bits2d((u64)f2i64(std::trunc(b))); break;                       // fctidz
+                                  case 846: F[rt] = (double)(s64)d2bits(b); break;                                  // fcfid
+                                  case 583: F[rt] = bits2d(0); break;                                               // mffs
+                                  case 711: case 70: case 38: case 134: break;                                      // mtfsf mtfsb0 mtfsb1 mtfsfi
+                                  default: bad = true; break;
+                              }
+                              break;
+                      }
+                      break; }
+                  case 32: case 33: { u64 ea = (op == 33 ? R[ra] : ra0()) + (u64)simm; R[rt] = m.r32(ea); if (op == 33) R[ra] = ea; break; }
+                  case 34: case 35: { u64 ea = (op == 35 ? R[ra] : ra0()) + (u64)simm; R[rt] = m.r8(ea); if (op == 35) R[ra] = ea; break; }
+                  case 40: case 41: { u64 ea = (op == 41 ? R[ra] : ra0()) + (u64)simm; R[rt] = m.r16(ea); if (op == 41) R[ra] = ea; break; }
+                  case 42: R[rt] = (u64)(s64)(s16)m.r16(ra0() + (u64)simm); break;                    // lha
+                  case 36: case 37: { u64 ea = (op == 37 ? R[ra] : ra0()) + (u64)simm; m.w32(ea, (u32)R[rt]); if (op == 37) R[ra] = ea; break; }
+                  case 38: case 39: { u64 ea = (op == 39 ? R[ra] : ra0()) + (u64)simm; m.w8(ea, (u8)R[rt]); if (op == 39) R[ra] = ea; break; }
+                  case 44: case 45: { u64 ea = (op == 45 ? R[ra] : ra0()) + (u64)simm; m.w16(ea, (u16)R[rt]); if (op == 45) R[ra] = ea; break; }
+                  case 58: { s64 ds = (s16)(i & 0xFFFC); int sub = i & 3;                             // ld ldu lwa
+                      u64 ea = (sub == 1 ? R[ra] : ra0()) + (u64)ds;
+                      if (sub == 2) R[rt] = (u64)(s64)(s32)m.r32(ea); else R[rt] = m.r64(ea);
+                      if (sub == 1) R[ra] = ea;
+                      break; }
+                  case 62: { s64 ds = (s16)(i & 0xFFFC); int sub = i & 3;                             // std stdu
+                      u64 ea = (sub == 1 ? R[ra] : ra0()) + (u64)ds;
+                      m.w64(ea, R[rt]);
+                      if (sub == 1) R[ra] = ea;
+                      break; }
+                  default: bad = true; break;
+              }
+
+              if (bad) {
+                  cplog("[PPU] Desteklenmeyen komut %08X @ 0x%llX (op=%u)", i, (ull)pc, op);
+                  c.halted = true; c.insts--; return;
+              }
+              if (m.fault) { c.halted = true; return; }
+              c.pc = npc;
+          }
+
+          static void runLoop() {
+              g_t0 = std::chrono::steady_clock::now();
+              u64 start = g_cpu.insts;
+              cplog("[Cepde3] Çalışma başladı, PC=0x%llX", (ull)g_cpu.pc);
+              while (g_run && !g_cpu.halted) {
+                  for (int k = 0; k < 50000 && !g_cpu.halted; k++) step(g_cpu, g_mem);
+              }
+              double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_t0).count();
+              u64 n = g_cpu.insts - start;
+              g_mipsLast = dt > 0 ? n / dt / 1e6 : 0;
+              if (g_mem.fault) cplog("[MEM] Geçersiz adres 0x%llX (PC=0x%llX)", (ull)g_mem.faultAddr, (ull)g_cpu.pc);
+              if (g_cpu.halted) cplog("[Cepde3] Bitti: %llu komut, %.3f sn, %.2f MIPS", (ull)n, dt, g_mipsLast);
+              else cplog("[Cepde3] Durduruldu: %llu komut", (ull)n);
+              g_run = false;
+          }
+
+          static void stopRun() { g_run = false; if (g_th.joinable()) g_th.join(); }
+          static void startRun() {
+              if (!g_loaded || g_run) return;
+              if (g_th.joinable()) g_th.join();
+              g_cpu.halted = false; g_run = true;
+              g_th = std::thread(runLoop);
+          }
+
+          // ---------------- A1: ELF64 yukleyici ----------------
+          static inline u16 be16(const u8* p) { return (u16)((p[0] << 8) | p[1]); }
+          static inline u32 be32(const u8* p) { return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3]; }
+          static inline u64 be64(const u8* p) { return ((u64)be32(p) << 32) | be32(p + 4); }
+
+          static bool loadElfBytes(const u8* d, size_t n, std::string& err) {
+              std::lock_guard<std::mutex> lk(g_mx);
+              g_loaded = false;
+              if (n >= 4 && !memcmp(d, "SCE\0", 4)) { err = "Şifreli SELF desteklenmiyor (önce düz ELF'e çözülmeli)"; return false; }
+              if (n < 64 || memcmp(d, "\x7f""ELF", 4)) { err = "ELF değil"; return false; }
+              if (d[4] != 2 || d[5] != 2) { err = "64-bit big-endian ELF değil"; return false; }
+              if (be16(d + 18) != 21) { err = "PowerPC64 ELF değil"; return false; }
+              u64 entry = be64(d + 24), phoff = be64(d + 32);
+              u16 phent = be16(d + 54), phnum = be16(d + 56);
+              g_mem.release();
+              if (!g_mem.init()) { err = "Bellek ayrılamadı"; return false; }
+              u64 minAddr = ~0ULL; int loaded = 0;
+              for (u16 k = 0; k < phnum; k++) {
+                  u64 po = phoff + (u64)k * phent;
+                  if (po + 56 > n) break;
+                  const u8* p = d + po;
+                  if (be32(p) != 1) continue; // PT_LOAD
+                  u64 off = be64(p + 8), va = be64(p + 16), fsz = be64(p + 32), msz = be64(p + 40);
+                  if (off + fsz > n || fsz > msz || va + msz > g_mem.size) { err = "Geçersiz segment"; return false; }
+                  memcpy(g_mem.base + va, d + off, fsz);
+                  if (va < minAddr) minAddr = va;
+                  loaded++;
+                  cplog("[ELF] Segment: 0x%llX boyut=0x%llX", (ull)va, (ull)msz);
+              }
+              if (!loaded) { err = "Yüklenecek segment yok"; return false; }
+              g_viewBase = minAddr;
+              g_cpu = PPU();
+              g_heap = 0x30000000ULL;
+              u64 pcv = g_mem.r64(entry), toc = g_mem.r64(entry + 8);
+              if (g_mem.fault) { err = "Giriş noktası okunamadı"; return false; }
+              u64 top = g_mem.size > 0xD0000000ULL ? 0xD0000000ULL : g_mem.size - 0x10000;
+              g_cpu.pc = pcv; g_cpu.gpr[2] = toc; g_cpu.gpr[1] = top - 0x100;
+              g_cpu.halted = false;
+              g_loaded = true;
+              cplog("[ELF] Giriş: OPD=0x%llX PC=0x%llX TOC=0x%llX, bellek=%llu MB", (ull)entry, (ull)pcv, (ull)toc, (ull)(g_mem.size >> 20));
+              return true;
+          }
+
+          // Dahili test ELF: dongu (1000 tur) + tty_write + exit(r6)
+          static std::vector<u8> buildSelfTestElf() {
+              std::vector<u8> f(0x410, 0);
+              auto p16 = [&](size_t o, u16 v) { f[o] = v >> 8; f[o + 1] = (u8)v; };
+              auto p32 = [&](size_t o, u32 v) { for (int k = 0; k < 4; k++) f[o + k] = (v >> (24 - 8 * k)) & 0xFF; };
+              auto p64 = [&](size_t o, u64 v) { for (int k = 0; k < 8; k++) f[o + k] = (v >> (56 - 8 * k)) & 0xFF; };
+              memcpy(f.data(), "\x7f""ELF", 4); f[4] = 2; f[5] = 2; f[6] = 1;
+              p16(16, 2); p16(18, 21); p32(20, 1); p64(24, 0x10200); p64(32, 64);
+              p16(52, 64); p16(54, 56); p16(56, 1); p16(58, 64);
+              p32(64, 1); p32(68, 7); p64(72, 0x100); p64(80, 0x10000); p64(88, 0x10000);
+              p64(96, 0x310); p64(104, 0x1000); p64(112, 0x10000);
+              const u32 code[] = {
+                  0x38C00000, // li r6,0
+                  0x38E003E8, // li r7,1000
+                  0x7CE903A6, // mtctr r7
+                  0x38C60001, // loop: addi r6,r6,1
+                  0x4200FFFC, // bdnz loop
+                  0x39600193, // li r11,403 (sys_tty_write)
+                  0x38600000, // li r3,0
+                  0x3C800001, // lis r4,1
+                  0x60840300, // ori r4,r4,0x300
+                  0x38A00010, // li r5,16
+                  0x44000002, // sc
+                  0x7CC33378, // mr r3,r6
+                  0x39600016, // li r11,22 (sys_process_exit)
+                  0x44000002  // sc
+              };
+              for (size_t k = 0; k < sizeof(code) / 4; k++) p32(0x100 + k * 4, code[k]);
+              p64(0x300, 0x10000); p64(0x308, 0);
+              memcpy(&f[0x400], "Merhaba Cepde3!\n", 16);
+              return f;
+          }
+
+          // ---------------- JNI ----------------
+          extern "C" {
+          JNIEXPORT jboolean JNICALL Java_com_cepde3_app_Native_loadElf(JNIEnv* e, jobject, jbyteArray arr) {
+              stopRun();
+              jsize n = e->GetArrayLength(arr);
+              std::vector<u8> buf((size_t)n);
+              e->GetByteArrayRegion(arr, 0, n, (jbyte*)buf.data());
+              std::string err;
+              bool ok = loadElfBytes(buf.data(), buf.size(), err);
+              if (!ok) cplog("[ELF] HATA: %s", err.c_str());
+              return ok;
+          }
+          JNIEXPORT jboolean JNICALL Java_com_cepde3_app_Native_loadSelfTest(JNIEnv*, jobject) {
+              stopRun();
+              std::vector<u8> elf = buildSelfTestElf();
+              std::string err;
+              cplog("[Cepde3] Dahili test ELF'i yükleniyor...");
+              bool ok = loadElfBytes(elf.data(), elf.size(), err);
+              if (!ok) cplog("[ELF] HATA: %s", err.c_str());
+              return ok;
+          }
+          JNIEXPORT void JNICALL Java_com_cepde3_app_Native_start(JNIEnv*, jobject) { startRun(); }
+          JNIEXPORT void JNICALL Java_com_cepde3_app_Native_stop(JNIEnv*, jobject) { stopRun(); }
+          JNIEXPORT jboolean JNICALL Java_com_cepde3_app_Native_isRunning(JNIEnv*, jobject) { return g_run.load(); }
+          JNIEXPORT void JNICALL Java_com_cepde3_app_Native_setPad(JNIEnv*, jobject, jint m) { g_pad = (u32)m; }
+          JNIEXPORT jstring JNICALL Java_com_cepde3_app_Native_pollLog(JNIEnv* e, jobject) {
+              std::string s;
+              { std::lock_guard<std::mutex> l(g_logMx); s.swap(g_log); }
+              return e->NewStringUTF(s.c_str());
+          }
+          JNIEXPORT jstring JNICALL Java_com_cepde3_app_Native_stats(JNIEnv* e, jobject) {
+              char b[200];
+              double mips = g_mipsLast;
+              if (g_run) {
+                  double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_t0).count();
+                  mips = dt > 0.05 ? g_cpu.insts / dt / 1e6 : 0;
+              }
+              snprintf(b, sizeof b, "[%s] PC=%08llX komut=%llu MIPS=%.1f pad=%03X",
+                       g_run ? "ÇALIŞIYOR" : (g_loaded ? "DURDU" : "BOŞTA"),
+                       (ull)g_cpu.pc, (ull)g_cpu.insts, mips, g_pad.load());
+              return e->NewStringUTF(b);
+          }
+          JNIEXPORT void JNICALL Java_com_cepde3_app_Native_setVideo(JNIEnv*, jobject, jboolean v) { g_video = v != 0; }
+          JNIEXPORT jstring JNICALL Java_com_cepde3_app_Native_describe(JNIEnv* e, jobject, jbyteArray arr) {
+              jsize n = e->GetArrayLength(arr);
+              std::vector<u8> b((size_t)n + 16, 0);
+              e->GetByteArrayRegion(arr, 0, n, (jbyte*)b.data());
+              const char* s;
+              if (n >= 4 && !memcmp(b.data(), "SCE\0", 4)) s = "Şifreli SELF/EBOOT.BIN. Cepde3 şifre çözmez; düz (şifresiz) ELF gerekir.";
+              else if (n >= 4 && !memcmp(b.data(), "\x7f""PKG", 4)) s = "PKG paketi. İçindeki dosyalar şifreli olabilir; düz ELF gerekir.";
+              else if (n > 0x8006 && !memcmp(&b[0x8001], "CD001", 5)) s = "ISO disk imajı. Doğrudan çalıştırılamaz; içindeki EBOOT.BIN şifreliyse düz ELF gerekir.";
+              else s = "Tanınmayan biçim (ELF değil).";
+              return e->NewStringUTF(s);
+          }
+          // A4 (ilk adim): bellek haritasi gorunumu. Her bayt 4x4 piksel, turuncu = su anki komut (PC)
+          JNIEXPORT void JNICALL Java_com_cepde3_app_Native_fillFramebuffer(JNIEnv* e, jobject, jintArray arr) {
+              const int W = 640, H = 360;
+              jint* px = e->GetIntArrayElements(arr, nullptr);
+              {
+                  std::lock_guard<std::mutex> lk(g_mx);
+                  if (!g_mem.base) {
+                      for (int y = 0; y < H; y++) for (int x = 0; x < W; x++)
+                          px[y * W + x] = (jint)(((x / 32 + y / 32) & 1) ? 0xFF14183F : 0xFF0B0E2E);
+                  } else if (g_video.load()) {
+                      // Video modu: PS3 yerel bellek (0xC0000000) ustunde 1280x720 A8R8G8B8 cerceve, 2x kucultulmus
+                      for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+                          u64 a = 0xC0000000ULL + ((u64)(y * 2) * 1280 + (u64)(x * 2)) * 4;
+                          u32 v = 0;
+                          if (a + 4 <= g_mem.size) { memcpy(&v, g_mem.base + a, 4); v = __builtin_bswap32(v); }
+                          px[y * W + x] = (jint)(v | 0xFF000000u);
+                      }
+                  } else {
+                      u64 pcv = g_cpu.pc;
+                      for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+                          u64 a = g_viewBase + (u64)((y / 4) * (W / 4) + (x / 4));
+                          u32 v = a < g_mem.size ? g_mem.base[a] : 0;
+                          u32 col = 0xFF000000u | ((v >> 2) << 16) | (v << 8) | (v >> 1);
+                          if (a >= pcv && a < pcv + 4) col = 0xFFFFA000u;
+                          px[y * W + x] = (jint)col;
+                      }
+                  }
+              }
+              e->ReleaseIntArrayElements(arr, px, 0);
+          }
+          } // extern "C"
+          EOF
+
+      - name: Logo ciz (Pillow) ve ikon boyutlarina yaz
+        run: |
+          set -e
+          pip install pillow
+          python3 - <<'PY'
+          from PIL import Image, ImageDraw, ImageFont
+          import os
+
+          S = 1024
+          img = Image.new("RGBA", (S, S))
+          px = img.load()
+          for y in range(S):
+              for x in range(S):
+                  t = (x + y) / (2.0 * S)
+                  px[x, y] = (int(10 + 70 * t), int(14 + 24 * t), int(46 + 120 * t), 255)
+
+          # parlama halkalari (seffaf katman)
+          glow = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+          gd = ImageDraw.Draw(glow)
+          for r, a in ((470, 60), (430, 42), (390, 26)):
+              gd.ellipse([S/2 - r, S/2 - r, S/2 + r, S/2 + r], outline=(120, 170, 255, a), width=6)
+          img = Image.alpha_composite(img, glow)
+          d = ImageDraw.Draw(img)
+
+          # PlayStation tarzi dort sembol
+          W = 26
+          cy = 330
+          xs = [227, 417, 607, 797]
+          g, r_, b, p = (64, 214, 160), (240, 80, 90), (90, 150, 255), (240, 130, 220)
+          R = 78
+          # ucgen
+          cx = xs[0]
+          tri = [(cx, cy - R), (cx + R, cy + R * 0.8), (cx - R, cy + R * 0.8)]
+          d.line(tri + [tri[0]], fill=g, width=W, joint="curve")
+          # daire
+          cx = xs[1]
+          d.ellipse([cx - R, cy - R, cx + R, cy + R], outline=r_, width=W)
+          # carpi
+          cx = xs[2]
+          d.line([(cx - R, cy - R), (cx + R, cy + R)], fill=b, width=W)
+          d.line([(cx - R, cy + R), (cx + R, cy - R)], fill=b, width=W)
+          # kare
+          cx = xs[3]
+          d.rectangle([cx - R, cy - R, cx + R, cy + R], outline=p, width=W)
+
+          def font(size):
+              for path in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                           "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"):
+                  if os.path.exists(path):
+                      return ImageFont.truetype(path, size)
+              return ImageFont.load_default(size)
+
+          def center(text, y, f, fill, shadow=None):
+              bb = d.textbbox((0, 0), text, font=f)
+              w = bb[2] - bb[0]
+              x = (S - w) / 2 - bb[0]
+              if shadow:
+                  d.text((x + 8, y + 8), text, font=f, fill=shadow)
+              d.text((x, y), text, font=f, fill=fill)
+
+          center("Cepde3", 540, font(205), (255, 255, 255, 255), (0, 0, 30, 140))
+          center("PS3  \u2022  ANDROID", 810, font(66), (150, 200, 255, 255))
+
+          # yuvarlak kose maskesi
+          mask = Image.new("L", (S, S), 0)
+          ImageDraw.Draw(mask).rounded_rectangle([0, 0, S - 1, S - 1], radius=220, fill=255)
+          out = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+          out.paste(img, (0, 0), mask)
+
+          M = "Cepde3/app/src/main/res"
+          out.resize((512, 512), Image.LANCZOS).save(M + "/drawable-nodpi/logo.png")
+          for name, size in (("mdpi", 48), ("hdpi", 72), ("xhdpi", 96), ("xxhdpi", 144), ("xxxhdpi", 192)):
+              out.resize((size, size), Image.LANCZOS).save(M + "/mipmap-" + name + "/ic_launcher.png")
+          out.save("Cepde3-logo-1024.png")
+          print("Logo hazir")
+          PY
+
+      - name: Gradle wrapper ekle ve projeyi zip'le
+        run: |
+          set -e
+          cd Cepde3
+          gradle wrapper --gradle-version 8.7
+          mkdir -p .github/workflows
+          cp ../.github/workflows/Cepde3.yml .github/workflows/ 2>/dev/null || true
+          cd ..
+          zip -r Cepde3-proje.zip Cepde3 -x "*/build/*" "*/.gradle/*"
+
+      - name: APK derle
+        working-directory: Cepde3
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Ciktilari hazirla
+        run: |
+          cp Cepde3/app/build/outputs/apk/debug/app-debug.apk Cepde3.apk
+          ls -la Cepde3.apk Cepde3-proje.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Cepde3-APK
+          path: Cepde3.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Cepde3-proje
+          path: |
+            Cepde3-proje.zip
+            Cepde3-logo-1024.png
